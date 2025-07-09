@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Face Attendance Demo</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/face-api.js"></script>
+  <style>
+    body { font-family: Arial; margin: 30px; }
+    #video, #scanVideo { border: 2px solid #333; border-radius: 12px; }
+    .hidden { display: none; }
+    button { margin: 10px; padding: 10px 20px; font-size: 1rem;}
+    #register-status, #scan-status { color: green; margin: 15px 0; }
+    .nav { margin-bottom: 10px;}
+  </style>
+</head>
+<body>
+  <h2>Face Attendance Demo</h2>
+  <div class="nav">
+    <button onclick="showSection('register')">หน้าลงทะเบียน</button>
+    <button onclick="showSection('scan')">หน้าสแกนเข้า-ออก</button>
+  </div>
+
+  <div id="register-section">
+    <h3>ลงทะเบียนใบหน้า</h3>
+    <input id="emp_name" placeholder="ชื่อ-สกุล">
+    <input id="emp_id" placeholder="รหัสพนักงาน">
+    <br>
+    <video id="video" width="320" height="240" autoplay muted></video><br>
+    <button onclick="registerFace()">ลงทะเบียนใบหน้า</button>
+    <div id="register-status"></div>
+    <hr>
+  </div>
+
+  <div id="scan-section" class="hidden">
+    <h3>ลงเวลาเข้า-ออกงาน</h3>
+    <video id="scanVideo" width="320" height="240" autoplay muted></video><br>
+    <button onclick="scanFace('In')">สแกนเข้า</button>
+    <button onclick="scanFace('Out')">สแกนออก</button>
+    <div id="scan-status"></div>
+  </div>
+
+  <script>
+    let labeledDescriptor = null;
+    let empName = "";
+    let empId = "";
+    // === ใส่ URL Power Automate Webhook ของคุณ (ยังไม่ต้องแก้ตอนทดลอง) ===
+    const webhookUrl = 'https://YOUR-POWER-AUTOMATE-URL';
+
+    Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri('./models'),
+      faceapi.nets.faceRecognitionNet.loadFromUri('./models'),
+      faceapi.nets.faceLandmark68Net.loadFromUri('./models')
+    ]).then(startVideo);
+
+    // --- Part 1: ลงทะเบียนใบหน้า ---
+    async function startVideo() {
+      // เปิดกล้องสำหรับ register + scan
+      navigator.mediaDevices.getUserMedia({ video: {} })
+        .then(stream => {
+          document.getElementById('video').srcObject = stream;
+          document.getElementById('scanVideo').srcObject = stream;
+        });
+      // โหลด face descriptor จาก local ถ้ามี
+      if (localStorage.getItem('face_descriptor')) {
+        labeledDescriptor = JSON.parse(localStorage.getItem('face_descriptor'));
+        empName = localStorage.getItem('emp_name');
+        empId = localStorage.getItem('emp_id');
+        document.getElementById('scan-section').classList.remove('hidden');
+      }
+    }
+
+    async function registerFace() {
+      empName = document.getElementById('emp_name').value.trim();
+      empId = document.getElementById('emp_id').value.trim();
+      if (!empName || !empId) {
+        document.getElementById('register-status').innerText = "กรุณากรอกชื่อและรหัส";
+        return;
+      }
+      let video = document.getElementById('video');
+      let detection = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
+      if (!detection) {
+        document.getElementById('register-status').innerText = "ไม่พบใบหน้า! ลองใหม่อีกครั้ง";
+        return;
+      }
+      // เก็บ descriptor ใน LocalStorage
+      let desc = Array.from(detection.descriptor);
+      localStorage.setItem('face_descriptor', JSON.stringify(desc));
+      localStorage.setItem('emp_name', empName);
+      localStorage.setItem('emp_id', empId);
+      labeledDescriptor = desc;
+      document.getElementById('register-status').innerText = "✅ ลงทะเบียนสำเร็จ";
+      document.getElementById('scan-section').classList.remove('hidden');
+    }
+
+    // --- Part 2: สแกนใบหน้า (In/Out) + ส่งข้อมูลไป Power Automate ---
+    async function scanFace(status) {
+      if (!labeledDescriptor) {
+        document.getElementById('scan-status').innerText = "ยังไม่ได้ลงทะเบียนใบหน้า";
+        return;
+      }
+      let scanVideo = document.getElementById('scanVideo');
+      let detection = await faceapi.detectSingleFace(scanVideo, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
+      if (!detection) {
+        document.getElementById('scan-status').innerText = "❌ ไม่พบใบหน้า!";
+        return;
+      }
+      // เปรียบเทียบ descriptor
+      let dist = faceapi.euclideanDistance(labeledDescriptor, Array.from(detection.descriptor));
+      if (dist > 0.5) {
+        document.getElementById('scan-status').innerText = "❌ ใบหน้าไม่ตรงกับผู้ใช้!";
+        return;
+      }
+      // Capture ภาพ
+      let canvas = document.createElement('canvas');
+      canvas.width = 320; canvas.height = 240;
+      let ctx = canvas.getContext('2d');
+      ctx.drawImage(scanVideo, 0, 0, 320, 240);
+      let imageBase64 = canvas.toDataURL('image/jpeg', 0.7);
+
+      // Get Location (GPS)
+      document.getElementById('scan-status').innerText = "กำลังบันทึกตำแหน่งและส่งข้อมูล...";
+      navigator.geolocation.getCurrentPosition(function(pos) {
+        let latitude = pos.coords.latitude;
+        let longitude = pos.coords.longitude;
+
+        // ส่งข้อมูลไป Power Automate Webhook
+        fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: empName,
+            employeeId: empId,
+            status: status,
+            time: new Date().toISOString(),
+            device: "Web",
+            latitude: latitude,
+            longitude: longitude,
+            image: imageBase64
+          })
+        }).then(r => {
+          if (r.ok) {
+            document.getElementById('scan-status').innerText = "✅ บันทึกเวลาเรียบร้อย!";
+          } else {
+            document.getElementById('scan-status').innerText = "❌ เกิดข้อผิดพลาด: " + r.statusText;
+          }
+        });
+      }, function() {
+        document.getElementById('scan-status').innerText = "❌ ไม่สามารถดึง GPS location";
+      });
+    }
+
+    function showSection(page) {
+      if (page === "register") {
+        document.getElementById('register-section').classList.remove('hidden');
+        document.getElementById('scan-section').classList.add('hidden');
+      } else {
+        document.getElementById('scan-section').classList.remove('hidden');
+        document.getElementById('register-section').classList.add('hidden');
+      }
+    }
+  </script>
+</body>
+</html>
